@@ -1,0 +1,10 @@
+build/
+*.wav
+*.o
+*.a
+*.out
+# Built binaries at the repo root only; the leading slash matters, since a
+# bare `bravebeats` would also match the src/bravebeats/ source directory
+/bravebeats
+/bravebeats_tests
+.DS_Store
