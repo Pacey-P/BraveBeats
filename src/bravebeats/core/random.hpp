@@ -56,8 +56,18 @@ public:
 
     // Sum of three uniforms, so most values land near the middle. Symmetric
     // drift for humanising timing and level, without the hard edges of a
-    // flat distribution
-    float centred() { return (uniform() + uniform() + uniform()) * (2.0f / 3.0f) - 1.0f; }
+    // flat distribution.
+    //
+    // The three draws are taken one statement at a time. Written as one sum
+    // the compiler may evaluate them in any order, and since floating-point
+    // addition is not associative that would put the last bits of the result,
+    // and so the odd note time, at the mercy of the toolchain
+    float centred() {
+        const float first = uniform();
+        const float second = uniform();
+        const float third = uniform();
+        return (first + second + third) * (2.0f / 3.0f) - 1.0f;
+    }
 
     // Pick an index from unnormalised weights
     int weighted(const std::vector<float> &weights) {

@@ -261,6 +261,30 @@ void testWav() {
     std::remove(path.c_str());
 }
 
+// A stable summary of an entire composition. Any change to how random draws
+// are ordered or consumed moves this, which is exactly what we want to catch
+uint64_t fingerprint(const music::Composition &piece) {
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&hash](uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    mix(static_cast<uint64_t>(piece.notes.size()));
+    mix(static_cast<uint64_t>(piece.totalBars));
+    mix(static_cast<uint64_t>(piece.pulsesPerBar));
+    mix(static_cast<uint64_t>(piece.rootMidi));
+    mix(static_cast<uint64_t>(piece.tempo * 1e6));
+    for (const music::Note &note : piece.notes) {
+        mix(static_cast<uint64_t>(std::llround(note.time * 48000.0)));
+        mix(static_cast<uint64_t>(note.voice));
+        mix(static_cast<uint64_t>(std::llround(note.velocity * 1e6)));
+        mix(static_cast<uint64_t>(std::llround(note.pitch * 1e6)));
+        mix(static_cast<uint64_t>(std::llround(note.duration * 1e6)));
+        mix(static_cast<uint64_t>(std::llround(note.pan * 1e6)));
+    }
+    return hash;
+}
+
 music::Composition composeFor(uint64_t seed, double seconds) {
     music::ComposerSettings settings;
     settings.seed = seed;
@@ -346,6 +370,181 @@ void testComposition() {
     check(!tiny.notes.empty(), "a very short piece still has notes");
 }
 
+// These numbers are the seed contract written down.
+//
+// They were produced identically by gcc at -O0 and -O2, by clang, and by the
+// WebAssembly build, which is the point: a seed has to mean the same music
+// everywhere. They moved once already, when two random draws were being passed
+// as arguments to the same call and the compiler was free to take them in
+// either order. If a change here is deliberate, update them; if it is not,
+// something has started consuming randomness in a different order
+void testSeedContract() {
+    std::printf("seed contract\n");
+    struct Expected {
+        uint64_t seed;
+        std::size_t notes;
+        uint64_t fingerprint;
+    };
+    static const Expected kPieces[] = {
+        {1ull, 401u, 0x777d9b63de9b5e0eull},
+        {42ull, 443u, 0xb5b15e79e0363b9dull},
+        {20260828ull, 518u, 0x6fcf704982574e03ull},
+    };
+    for (const Expected &expected : kPieces) {
+        const music::Composition piece = composeFor(expected.seed, 30.0);
+        check(piece.notes.size() == expected.notes,
+              "seed " + std::to_string(expected.seed) + " keeps its note count");
+        check(fingerprint(piece) == expected.fingerprint,
+              "seed " + std::to_string(expected.seed) + " keeps its fingerprint");
+    }
+
+    music::ComposerSettings loop;
+    loop.seed = 7ull;
+    loop.loopBars = 8;
+    const music::Composition looped = music::compose(loop);
+    check(looped.notes.size() == 442u, "the loop keeps its note count");
+    check(fingerprint(looped) == 0xeb0e11e57b3e9744ull, "the loop keeps its fingerprint");
+}
+
+void testLoopMode() {
+    std::printf("loop mode\n");
+    music::ComposerSettings settings;
+    settings.seed = 99ull;
+    settings.loopBars = 4;
+    const music::Composition loop = music::compose(settings);
+
+    check(loop.loopSeconds > 0.0, "a loop reports its own length");
+    check(loop.sections.size() == 1 && loop.sections[0].bars == 4,
+          "a loop is one section of the bars asked for");
+    check(std::fabs(loop.loopSeconds - 4.0 * loop.barSeconds) < 1.0e-9,
+          "the loop length is exactly its bars");
+    check(loop.totalSeconds == loop.loopSeconds, "a loop has no tail past the wrap");
+
+    bool inside = true;
+    bool tagged = false;
+    for (const music::Note &note : loop.notes) {
+        inside = inside && note.time < loop.loopSeconds;
+        tagged = tagged || note.minIntensity > 0.0f;
+    }
+    check(inside, "every note falls inside the loop");
+    check(tagged, "parts carry the intensity they need");
+
+    // Everything is written down at full intensity, so a live host has the
+    // whole ensemble available to fade in and out
+    int voicesSeen[static_cast<int>(music::Voice::Count)] = {0};
+    for (const music::Note &note : loop.notes) voicesSeen[static_cast<int>(note.voice)]++;
+    int silent = 0;
+    for (int v = 0; v < static_cast<int>(music::Voice::Count); ++v) {
+        if (voicesSeen[v] == 0) ++silent;
+    }
+    check(silent <= 1, "a loop writes down nearly every part");
+
+    // Playing quietly must actually thin the ensemble out
+    engine::RenderSettings render;
+    render.sampleRate = 24000;
+    render.targetPeak = 0.0f;
+    render.tailSeconds = 0.0;
+
+    float previousRms = -1.0f;
+    bool risesWithIntensity = true;
+    for (float intensity : {0.15f, 0.5f, 1.0f}) {
+        engine::Renderer renderer;
+        renderer.setIntensity(intensity);
+        renderer.prepare(loop, render);
+        const int frames = static_cast<int>(loop.loopSeconds * render.sampleRate);
+        std::vector<float> left(static_cast<std::size_t>(frames), 0.0f);
+        std::vector<float> right(static_cast<std::size_t>(frames), 0.0f);
+        renderer.renderBlock(left.data(), right.data(), frames);
+
+        double sum = 0.0;
+        for (int i = 0; i < frames; ++i) {
+            sum += static_cast<double>(left[i]) * left[i] + static_cast<double>(right[i]) * right[i];
+        }
+        const float rms = static_cast<float>(std::sqrt(sum / (2.0 * frames)));
+        risesWithIntensity = risesWithIntensity && rms > previousRms;
+        previousRms = rms;
+    }
+    check(risesWithIntensity, "raising intensity brings more of the ensemble in");
+
+    // The wrap must be seamless: no click, no gap
+    engine::Renderer renderer;
+    renderer.prepare(loop, render);
+    const int frames = static_cast<int>(loop.loopSeconds * render.sampleRate * 2.2);
+    std::vector<float> left(static_cast<std::size_t>(frames), 0.0f);
+    std::vector<float> right(static_cast<std::size_t>(frames), 0.0f);
+    renderer.renderBlock(left.data(), right.data(), frames);
+
+    const int wrap = static_cast<int>(loop.loopSeconds * render.sampleRate);
+    float biggestStep = 0.0f;
+    for (int i = 1; i < frames; ++i) biggestStep = std::max(biggestStep, std::fabs(left[i] - left[i - 1]));
+    const float stepAtWrap = std::fabs(left[wrap] - left[wrap - 1]);
+    check(stepAtWrap <= biggestStep,
+          "the loop point is no more of a jump than the music already makes");
+
+    float tailPeak = 0.0f;
+    for (int i = wrap - 200; i < wrap + 200 && i < frames; ++i) {
+        if (i >= 0) tailPeak = std::max(tailPeak, std::fabs(left[i]));
+    }
+    check(tailPeak > 1.0e-4f, "the loop keeps sounding across the wrap");
+}
+
+void testStreaming() {
+    std::printf("streaming\n");
+    music::ComposerSettings settings;
+    settings.seed = 31337ull;
+    settings.durationSeconds = 6.0;
+    const music::Composition piece = music::compose(settings);
+
+    engine::RenderSettings render;
+    render.sampleRate = 24000;
+    render.targetPeak = 0.0f;
+
+    // Block size must not change the output, or a host with a different
+    // quantum would get different music
+    std::vector<float> whole;
+    {
+        engine::Renderer renderer;
+        renderer.prepare(piece, render);
+        const int frames = 24000;
+        whole.assign(static_cast<std::size_t>(frames) * 2u, 0.0f);
+        std::vector<float> left(static_cast<std::size_t>(frames)), right(static_cast<std::size_t>(frames));
+        renderer.renderBlock(left.data(), right.data(), frames);
+        for (int i = 0; i < frames; ++i) {
+            whole[static_cast<std::size_t>(i) * 2u] = left[static_cast<std::size_t>(i)];
+            whole[static_cast<std::size_t>(i) * 2u + 1u] = right[static_cast<std::size_t>(i)];
+        }
+    }
+    bool matches = true;
+    for (int blockSize : {1, 7, 128, 333, 1024}) {
+        engine::Renderer renderer;
+        renderer.prepare(piece, render);
+        std::vector<float> left(static_cast<std::size_t>(blockSize));
+        std::vector<float> right(static_cast<std::size_t>(blockSize));
+        int written = 0;
+        while (written < 24000) {
+            const int block = std::min(blockSize, 24000 - written);
+            renderer.renderBlock(left.data(), right.data(), block);
+            for (int i = 0; i < block; ++i) {
+                matches = matches && whole[static_cast<std::size_t>(written + i) * 2u] == left[static_cast<std::size_t>(i)];
+                matches = matches && whole[static_cast<std::size_t>(written + i) * 2u + 1u] == right[static_cast<std::size_t>(i)];
+            }
+            written += block;
+        }
+    }
+    check(matches, "the block size makes no difference to the audio");
+
+    // Silence at intensity zero, sound at full
+    engine::Renderer quiet;
+    quiet.setIntensity(0.0f);
+    quiet.prepare(piece, render);
+    std::vector<float> left(4800), right(4800);
+    quiet.renderBlock(left.data(), right.data(), 4800);
+    float quietPeak = 0.0f;
+    for (int i = 0; i < 4800; ++i) quietPeak = std::max(quietPeak, std::fabs(left[i]));
+    check(quietPeak < 0.02f, "nothing much plays at zero intensity");
+    check(std::fabs(quiet.intensity()) < 1.0e-6f, "the intensity reads back");
+}
+
 void testRender() {
     std::printf("rendering\n");
     music::ComposerSettings settings;
@@ -419,6 +618,9 @@ int main() {
     testDsp();
     testWav();
     testComposition();
+    testSeedContract();
+    testLoopMode();
+    testStreaming();
     testRender();
     std::printf("\n%d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;

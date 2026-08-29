@@ -11,20 +11,29 @@ vendored under `third_party/`.
 
 [drums]: https://github.com/analogcode/606-Inspired-Synth-Drums
 
-## Build
+There are two ways to use it: a command line tool that writes a WAV, and a
+TypeScript module for the browser that can also follow your game.
+
+## Try it
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+./build/bravebeats -s 20260828 -d 60 -o tribal.wav
 ```
 
 Needs a C++14 compiler and nothing else. There are no dependencies to fetch.
+Then play `tribal.wav` with anything.
 
-## Use
+For the browser version, with the intensity slider that shows the ensemble
+filling in and thinning out:
 
 ```sh
-./build/bravebeats -s 20260828 -d 180 -o tribal.wav
+cd web && npm install && npm run build && npm run demo
+# open http://localhost:8080
 ```
+
+## Command line
 
 ```
   -o, --out PATH       output WAV file (default tribal.wav)
@@ -136,6 +145,32 @@ the floor drum stays dry and close while the pipe and the voices sit back in
 the room. Drums run through a shared compressor and a little drive; the master
 ends on a lookahead limiter whose ceiling is a guarantee, not an aim.
 
+## In a game
+
+`web/` is the generator compiled to WebAssembly with a typed API, so a seed
+means the same music there as on the command line. Full documentation is in
+[`web/README.md`](web/README.md).
+
+```ts
+import { createAdaptive } from 'bravebeats';
+
+const track = await createAdaptive(new AudioContext(), { seed: 7, loopBars: 8 });
+track.connect(context.destination);
+
+track.intensity = threatLevel;   // 0 to 1, safe to set every frame
+```
+
+The track loops with no seam, and intensity decides how much of the ensemble
+is playing: the drone and the bell hold the bottom, and the drums, balafon,
+voices and hands join as it rises. Nothing restarts when it changes, because
+the voices and both effects run continuously across the loop point; only which
+notes get played changes. There is also `renderTrack()`, which hands back a
+finished `AudioBuffer` for music that does not need to react.
+
+The module is a plain 170 KB `.wasm` with no Emscripten glue, which is what
+lets it run inside an `AudioWorklet`. The `.wasm` is committed, so you do not
+need Emscripten unless you change the C++.
+
 ## Layout
 
 ```
@@ -143,14 +178,19 @@ src/bravebeats/
   core/      random, dsp, oscillators, wav writing
   music/     euclidean rhythms, scales, arrangement, the composer
   voices/    the drum kit wrapper and the synthesised melodic voices
-  engine/    the offline renderer and mix bus
+  engine/    the renderer and mix bus
+src/wasm/    the C surface the WebAssembly build exposes
+web/         the TypeScript module, its tests and a browser demo
 tests/       self-checks
 third_party/ vendored 606 drum DSP (MIT)
 ```
 
 `music/composer.hpp` turns a seed into a list of notes and touches no audio at
-all. `engine/renderer.hpp` takes that list and plays it. The split means you
-can inspect or change what is being played without going near the DSP.
+all. `engine/renderer.hpp` takes that list and plays it, either straight
+through for a finished piece or a block at a time for a live host. The split
+means you can inspect or change what is being played without going near the
+DSP, and it is what makes the adaptive mode possible: the notes are all written
+down in advance, and intensity decides which of them are heard.
 
 ## Tests
 

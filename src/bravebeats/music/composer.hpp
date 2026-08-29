@@ -66,6 +66,10 @@ struct Note {
     float duration = 0.5f; // seconds, only the sustained voices use it
     float pan = 0.0f;      // -1 left to +1 right
     float colour = 0.5f;   // decay for drums, brightness for the rest
+    // The intensity its part needs before it is heard. In a fixed arrangement
+    // the composer has already applied this; a game driving intensity live
+    // uses it to decide what plays right now
+    float minIntensity = 0.0f;
 };
 
 struct ComposerSettings {
@@ -75,6 +79,8 @@ struct ComposerSettings {
     int meterPulses = 0;            // 12 for compound, 16 for simple, 0 picks one
     std::string scaleName;          // empty picks one
     int root = 0;                   // MIDI note, 0 picks one
+    // Bars in a seamless loop for live use. 0 writes the full arc instead
+    int loopBars = 0;
 };
 
 struct Composition {
@@ -90,7 +96,22 @@ struct Composition {
     int rootMidi = 57;
     std::string scaleName = "minor-pentatonic";
     uint64_t seed = 0;
+    // Length of one turn of the loop, or 0 when this is a fixed piece
+    double loopSeconds = 0.0;
 };
+
+// Where the pitched parts join in. The drum layers carry their own entry
+// points; these are the matching numbers for everything else
+constexpr float kBalafonIntensity = 0.44f;
+constexpr float kKalimbaIntensity = 0.62f;
+constexpr float kFluteIntensity = 0.28f;
+constexpr float kChantIntensity = 0.66f;
+constexpr float kFillIntensity = 0.55f;
+
+// Below this a stroke cannot be heard under the rest of the ensemble. Letting
+// one through is not harmless: it takes a voice from the pool and cuts off a
+// drum that is still ringing
+constexpr float kMinAudibleVelocity = 0.002f;
 
 namespace detail {
 
@@ -162,24 +183,47 @@ public:
         out.rootMidi = settings_.root > 0 ? settings_.root : rng_.intRange(50, 58);
         root_ = out.rootMidi;
 
-        out.totalBars = std::max(4, static_cast<int>(std::lround(settings_.durationSeconds / out.barSeconds)));
-        out.sections = buildArrangement(out.totalBars, rng_);
-        int barsPlanned = 0;
-        for (const Section &section : out.sections) barsPlanned += section.bars;
-        out.totalBars = barsPlanned;
+        if (settings_.loopBars > 0) {
+            // One section at full intensity. Every part is written down, and
+            // what is actually heard is decided at playback by the live
+            // intensity rather than baked into the arrangement here
+            out.totalBars = settings_.loopBars;
+            Section loop;
+            loop.name = "loop";
+            loop.bars = out.totalBars;
+            loop.intensity = 1.0f;
+            out.sections.assign(1, loop);
+            out.loopSeconds = static_cast<double>(out.totalBars) * out.barSeconds;
+        } else {
+            out.totalBars = std::max(4, static_cast<int>(std::lround(settings_.durationSeconds / out.barSeconds)));
+            out.sections = buildArrangement(out.totalBars, rng_);
+            int barsPlanned = 0;
+            for (const Section &section : out.sections) barsPlanned += section.bars;
+            out.totalBars = barsPlanned;
+        }
 
         buildDrumLayers(out);
         buildMelodicMaterial(out);
         renderSections(out);
 
+        out.notes.erase(std::remove_if(out.notes.begin(), out.notes.end(),
+                                       [](const Note &note) {
+                                           return note.velocity < kMinAudibleVelocity;
+                                       }),
+                        out.notes.end());
+
         std::stable_sort(out.notes.begin(), out.notes.end(),
                          [](const Note &a, const Note &b) { return a.time < b.time; });
 
-        double last = 0.0;
-        for (const Note &note : out.notes) {
-            last = std::max(last, note.time + static_cast<double>(note.duration));
+        if (out.loopSeconds > 0.0) {
+            out.totalSeconds = out.loopSeconds;
+        } else {
+            double last = 0.0;
+            for (const Note &note : out.notes) {
+                last = std::max(last, note.time + static_cast<double>(note.duration));
+            }
+            out.totalSeconds = std::max(last, static_cast<double>(out.totalBars) * out.barSeconds);
         }
-        out.totalSeconds = std::max(last, static_cast<double>(out.totalBars) * out.barSeconds);
         return out;
     }
 
@@ -242,7 +286,13 @@ private:
         {
             detail::DrumLayer low;
             low.voice = Voice::LowDrum;
-            low.pattern = without(euclidRotated(rng.intRange(3, 4), pulses, rng.intRange(0, pulses - 1)),
+            // Each draw is taken into its own variable on purpose. Passing two
+            // rng calls as arguments to one function leaves their order up to
+            // the compiler, which would make the seed mean different music on
+            // different toolchains
+            const int lowOnsets = rng.intRange(3, 4);
+            const int lowRotation = rng.intRange(0, pulses - 1);
+            low.pattern = without(euclidRotated(lowOnsets, pulses, lowRotation),
                                   layers_[1].pattern);
             if (onsetCount(low.pattern) == 0) low.pattern[static_cast<std::size_t>(sub)] = true;
             low.cycle = pulses;
@@ -265,7 +315,9 @@ private:
             const std::vector<int> crossCycles = pulses == 12 ? std::vector<int>{8, 9, 10, 12}
                                                              : std::vector<int>{10, 12, 14, 16};
             mid.cycle = rng.pick(crossCycles);
-            mid.pattern = euclidRotated(rng.intRange(3, 5), mid.cycle, rng.intRange(0, mid.cycle - 1));
+            const int midOnsets = rng.intRange(3, 5);
+            const int midRotation = rng.intRange(0, mid.cycle - 1);
+            mid.pattern = euclidRotated(midOnsets, mid.cycle, midRotation);
             mid.accents = detail::accentMap(mid.cycle, sub, rng);
             mid.entry = 0.52f;
             mid.level = 0.72f;
@@ -282,8 +334,9 @@ private:
             detail::DrumLayer high;
             high.voice = Voice::HighDrum;
             high.cycle = rng.chance(0.4f) ? (pulses == 12 ? 6 : 8) : pulses;
-            high.pattern = euclidRotated(rng.intRange(high.cycle / 2, high.cycle - 2),
-                                         high.cycle, rng.intRange(0, high.cycle - 1));
+            const int highOnsets = rng.intRange(high.cycle / 2, high.cycle - 2);
+            const int highRotation = rng.intRange(0, high.cycle - 1);
+            high.pattern = euclidRotated(highOnsets, high.cycle, highRotation);
             high.accents = detail::accentMap(high.cycle, sub, rng);
             high.entry = 0.68f;
             high.level = 0.55f;
@@ -370,7 +423,9 @@ private:
         const int pulses = out.pulsesPerBar;
 
         // Balafon ostinato: an even rhythm with a walking line over it
-        balafonRhythm_ = euclidRotated(rng.intRange(4, 6), pulses, rng.intRange(0, pulses - 1));
+        const int balafonOnsets = rng.intRange(4, 6);
+        const int balafonRotation = rng.intRange(0, pulses - 1);
+        balafonRhythm_ = euclidRotated(balafonOnsets, pulses, balafonRotation);
         balafonLine_.clear();
         int degree = rng.pick(std::vector<int>{0, 0, 2, 4});
         for (int i = 0; i < onsetCount(balafonRhythm_); ++i) {
@@ -382,8 +437,23 @@ private:
         if (!balafonLine_.empty()) balafonLine_[0] = 0;
 
         // Kalimba fills the gaps the balafon leaves
-        kalimbaRhythm_ = without(euclidRotated(rng.intRange(3, 5), pulses, rng.intRange(0, pulses - 1)),
-                                 balafonRhythm_);
+        const int kalimbaOnsets = rng.intRange(3, 5);
+        const int kalimbaRotation = rng.intRange(0, pulses - 1);
+        const std::vector<bool> kalimbaBase = euclid(kalimbaOnsets, pulses);
+        // Taking the balafon's pulses out is what makes the two interlock, but
+        // one rotation in ten lands entirely underneath it and leaves nothing
+        // at all. Turn the cycle until something survives
+        kalimbaRhythm_.clear();
+        for (int offset = 0; offset < pulses; ++offset) {
+            const int rotation = (kalimbaRotation + offset) % pulses;
+            const std::vector<bool> candidate = without(rotate(kalimbaBase, rotation), balafonRhythm_);
+            if (onsetCount(candidate) > 0) {
+                kalimbaRhythm_ = candidate;
+                break;
+            }
+        }
+        // The balafon covers every pulse, so interlocking is not on offer
+        if (kalimbaRhythm_.empty()) kalimbaRhythm_ = rotate(kalimbaBase, kalimbaRotation);
         kalimbaLine_.clear();
         degree = rng.intRange(2, 6);
         for (int i = 0; i < onsetCount(kalimbaRhythm_); ++i) {
@@ -413,7 +483,9 @@ private:
 
                 if (!section.drumsMuted) {
                     emitDrums(out, section, barIndex, barStart, rng);
-                    if (lastBarOfSection && section.intensity > 0.4f && sectionIndex + 1 < out.sections.size()) {
+                    const bool leadsSomewhere = sectionIndex + 1 < out.sections.size() ||
+                                                out.loopSeconds > 0.0;
+                    if (lastBarOfSection && section.intensity > kFillIntensity - 0.15f && leadsSomewhere) {
                         emitFill(out, section, barStart, rng);
                     }
                 }
@@ -456,6 +528,7 @@ private:
                 note.pitch = layer.pitch;
                 note.pan = layer.pan;
                 note.colour = layer.colour;
+                note.minIntensity = layer.entry;
                 out.notes.push_back(note);
 
                 // Hands never land together, so the clap is two strokes a few
@@ -495,6 +568,7 @@ private:
             note.pitch = 1.7f - 0.55f * ramp;
             note.pan = rng.range(-0.45f, 0.45f);
             note.colour = 0.35f;
+            note.minIntensity = kFillIntensity;
             out.notes.push_back(note);
         }
     }
@@ -504,7 +578,7 @@ private:
         const int pulses = out.pulsesPerBar;
 
         // Balafon carries the tune from the middle of the piece onward
-        if (section.intensity >= 0.44f) {
+        if (section.intensity >= kBalafonIntensity) {
             int onsetIndex = 0;
             for (int pulse = 0; pulse < pulses; ++pulse) {
                 if (!balafonRhythm_[static_cast<std::size_t>(pulse)]) continue;
@@ -523,12 +597,13 @@ private:
                 note.duration = static_cast<float>(pulseSeconds_ * 2.0);
                 note.pan = rng.range(-0.30f, 0.10f);
                 note.colour = rng.range(0.35f, 0.70f);
+                note.minIntensity = kBalafonIntensity;
                 out.notes.push_back(note);
             }
         }
 
         // Kalimba interlocks with it
-        if (section.intensity >= 0.62f && !kalimbaLine_.empty()) {
+        if (section.intensity >= kKalimbaIntensity && !kalimbaLine_.empty()) {
             int onsetIndex = 0;
             for (int pulse = 0; pulse < pulses; ++pulse) {
                 if (!kalimbaRhythm_[static_cast<std::size_t>(pulse)]) continue;
@@ -543,15 +618,19 @@ private:
                 note.duration = static_cast<float>(pulseSeconds_ * 3.0);
                 note.pan = rng.range(0.10f, 0.48f);
                 note.colour = rng.range(0.40f, 0.75f);
+                note.minIntensity = kKalimbaIntensity;
                 out.notes.push_back(note);
             }
         }
 
         // The pipe calls across the top, mostly in the quiet stretches and at
         // the ends of phrases
-        const bool phraseEnd = (barInSection % 4) == 3;
-        const bool callBar = section.drumsMuted ? (barInSection % 2) == 1 : phraseEnd;
-        if (callBar && (section.intensity >= 0.28f) && rng.chance(0.8f)) {
+        // The end of a four-bar phrase, or of a short section that never
+        // reaches one. Without the second case a piece built from one-bar
+        // sections has nowhere for the pipe to speak
+        const bool phraseEnd = (barInSection % 4) == 3 || barInSection == section.bars - 1;
+        const bool callBar = section.drumsMuted ? (barInSection % 2) == 1 || phraseEnd : phraseEnd;
+        if (callBar && (section.intensity >= kFluteIntensity) && rng.chance(0.8f)) {
             const int noteCount = rng.intRange(2, 4);
             double position = static_cast<double>(rng.intRange(0, out.subdivision));
             int degree = rng.pick(std::vector<int>{4, 5, 6, 7});
@@ -564,6 +643,7 @@ private:
                 note.velocity = clamp01(rng.range(0.34f, 0.56f));
                 note.pan = rng.range(-0.22f, 0.22f);
                 note.colour = rng.range(0.40f, 0.80f);
+                note.minIntensity = kFluteIntensity;
                 out.notes.push_back(note);
                 position += static_cast<double>(rng.intRange(1, out.subdivision + 1));
                 if (position >= pulses) break;
@@ -593,11 +673,12 @@ private:
                 note.velocity = clamp01(0.30f + 0.30f * section.intensity);
                 note.pan = rng.range(-0.12f, 0.12f);
                 note.colour = rng.range(0.35f, 0.75f);
+                note.minIntensity = 0.0f;  // the drone is always there
                 out.notes.push_back(note);
             }
 
             // Voices come in once the piece has some weight, or in the hollow
-            if (section.intensity >= 0.66f || section.drumsMuted) {
+            if (section.intensity >= kChantIntensity || section.drumsMuted) {
                 const int chordBars = 2;
                 int chordIndex = 0;
                 for (int bar = 0; bar < section.bars; bar += chordBars, ++chordIndex) {
@@ -616,6 +697,7 @@ private:
                         note.velocity = clamp01((0.22f + 0.20f * section.intensity) *
                                                   (v == 0 ? 1.0f : 0.78f));
                         note.pan = -0.62f + 0.62f * static_cast<float>(v);
+                        note.minIntensity = kChantIntensity;
                         note.colour = rng.range(0.30f, 0.70f);
                         out.notes.push_back(note);
                     }
