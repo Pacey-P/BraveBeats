@@ -16,6 +16,22 @@ TypeScript module for the browser that can also follow your game.
 
 ## Try it
 
+Open [`bravebeats.html`](bravebeats.html) in a browser. That is the whole
+thing: press play, drag the intensity slider and watch the ensemble fill in
+and thin out. No build, no server, no network - the generator and its
+WebAssembly are both baked into that one 249 KB file.
+
+Browsers will not load an audio worklet into a page opened straight off disk,
+so the file falls back to running on the main thread and says so. It sounds
+identical but can stutter if the browser gets busy. For the smooth path, serve
+the folder over http:
+
+```sh
+python3 -m http.server 8000    # then open http://localhost:8000/bravebeats.html
+```
+
+For a WAV on the command line:
+
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -23,15 +39,6 @@ cmake --build build
 ```
 
 Needs a C++14 compiler and nothing else. There are no dependencies to fetch.
-Then play `tribal.wav` with anything.
-
-For the browser version, with the intensity slider that shows the ensemble
-filling in and thinning out:
-
-```sh
-cd web && npm install && npm run build && npm run demo
-# open http://localhost:8080
-```
 
 ## Command line
 
@@ -170,6 +177,10 @@ finished `AudioBuffer` for music that does not need to react.
 The module is a plain 170 KB `.wasm` with no Emscripten glue, which is what
 lets it run inside an `AudioWorklet`. The `.wasm` is committed, so you do not
 need Emscripten unless you change the C++.
+
+`bravebeats.html` at the root is that same module and wasm inlined into one
+file, rebuilt by `npm run build` in `web/`. It is the quickest way to hear what
+a seed sounds like before wiring anything up.
 
 ## Layout
 

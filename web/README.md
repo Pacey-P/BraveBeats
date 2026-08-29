@@ -3,6 +3,11 @@
 The generator compiled to WebAssembly, with a typed API for the browser.
 Same C++ as the command line tool, so a seed means the same music in both.
 
+## Just want to hear it?
+
+Open `bravebeats.html` at the repository root. The module and the WebAssembly
+are inlined into that one file, so it needs no build, no server and no network.
+
 ## Install
 
 There is no published package yet. Copy `web/` into your project, or point
@@ -79,6 +84,22 @@ density changes.
 `AudioContext` must be resumed from a user gesture before anything is audible.
 That is a browser rule, not this module's.
 
+### When a worklet cannot be loaded
+
+A worklet module has to come from a real origin, so a page opened from disk
+with `file://` cannot use one - which also covers an Electron app loading its
+window from a file. By default `createAdaptive` throws there, with a message
+saying what to do about it. Pass `fallbackToScriptProcessor: true` and it
+renders the same audio on the main thread instead:
+
+```ts
+const track = await createAdaptive(context, { fallbackToScriptProcessor: true });
+if (track.usingFallback) console.warn('running on the main thread; may stutter');
+```
+
+It is off by default because you want to know when the good path is
+unavailable rather than quietly shipping a version that can glitch.
+
 ## API
 
 | | |
@@ -135,6 +156,8 @@ npm run build         # TypeScript to dist/
 npm test              # renders in Node and compares against the native binary
 npm run demo          # serves demo/ at http://localhost:8080
 node browser-check.mjs   # drives the demo in Chromium (needs playwright)
+npm run build:standalone # rebuilds bravebeats.html (run by npm run build)
+npm run check:standalone # opens bravebeats.html from disk in Chromium
 npm run build:wasm    # rebuilds the .wasm (needs Emscripten)
 ```
 

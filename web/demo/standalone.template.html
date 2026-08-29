@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BraveBeats</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #14100d; --panel: #1e1815; --raised: #2a221d; --line: #3a2f28;
+    --text: #f2e9df; --muted: #a3948a; --accent: #d97a44; --accent-dim: #8a4d2b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; padding: 2rem 1.25rem 3rem; background: var(--bg); color: var(--text);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; justify-content: center;
+  }
+  main { width: 100%; max-width: 680px; }
+  header { margin-bottom: 1.5rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 .3rem; letter-spacing: -.015em; }
+  .sub { color: var(--muted); margin: 0; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem;
+  }
+  .row { display: flex; gap: .625rem; align-items: center; flex-wrap: wrap; }
+  button {
+    font: inherit; font-weight: 600; padding: .6rem 1.15rem; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--raised); color: var(--text);
+    cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #1a1310; }
+  button.primary:hover:not(:disabled) { background: #e28850; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  label { display: block; font-size: .74rem; color: var(--muted); margin-bottom: .35rem;
+          text-transform: uppercase; letter-spacing: .07em; font-weight: 600; }
+  input[type=number], select {
+    font: inherit; padding: .5rem .6rem; border-radius: 8px; border: 1px solid var(--line);
+    background: #16110e; color: var(--text); width: 100%;
+  }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: .875rem; }
+  .intensity-head { display: flex; align-items: baseline; gap: .75rem; margin-bottom: .5rem; }
+  .intensity-value { font-variant-numeric: tabular-nums; font-size: 2.25rem; font-weight: 700; line-height: 1; }
+  .chips { display: flex; gap: .3rem; flex-wrap: wrap; margin-top: .85rem; }
+  .chip {
+    font-size: .72rem; padding: .22rem .55rem; border-radius: 20px;
+    border: 1px solid var(--line); color: var(--muted); transition: all .18s;
+  }
+  .chip.on { background: var(--accent); border-color: var(--accent); color: #1a1310; font-weight: 600; }
+  canvas { width: 100%; height: 96px; display: block; border-radius: 8px; background: #16110e; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .35rem 1.25rem; margin: 0; font-size: .9rem; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  .status { color: var(--muted); font-size: .875rem; min-height: 1.4em; margin: .9rem 0 0; }
+  .status.error { color: #e2725b; }
+  .note {
+    margin-top: .9rem; padding: .7rem .85rem; border-radius: 8px; font-size: .84rem;
+    background: #241a12; border: 1px solid var(--accent-dim); color: #e8c9a8;
+  }
+  .note[hidden] { display: none; }
+  kbd { background: #16110e; border: 1px solid var(--line); border-radius: 4px;
+        padding: .05rem .35rem; font: inherit; font-size: .85em; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>BraveBeats</h1>
+    <p class="sub">Procedural tribal music, generated in your browser. The seed decides the piece; intensity decides how much of the ensemble you hear.</p>
+  </header>
+
+  <div class="panel">
+    <div class="grid">
+      <div><label for="seed">Seed</label><input id="seed" type="number" value="20260828" min="0" step="1"></div>
+      <div><label for="bars">Loop bars</label><input id="bars" type="number" value="8" min="1" max="64"></div>
+      <div><label for="scale">Scale</label><select id="scale"><option value="">from seed</option></select></div>
+      <div><label for="meter">Meter</label><select id="meter">
+        <option value="0">from seed</option><option value="12">12/8</option><option value="16">4/4</option>
+      </select></div>
+    </div>
+    <div class="row" style="margin-top:1.15rem">
+      <button id="play" class="primary">Play</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="reseed">New seed</button>
+      <button id="download">Download a WAV</button>
+    </div>
+    <p class="status" id="status">Press play. Browsers need a click before any sound can start.</p>
+    <p class="note" id="fallback-note" hidden></p>
+  </div>
+
+  <div class="panel">
+    <div class="intensity-head">
+      <span class="intensity-value" id="intensity-value">1.00</span>
+      <label for="intensity" style="margin:0">Intensity</label>
+    </div>
+    <input id="intensity" type="range" min="0" max="1" step="0.01" value="1">
+    <div class="chips" id="chips"></div>
+    <p class="status" style="margin-top:.75rem">Drag it while the music plays. Parts join and drop out on the next notes, never part-way through a stroke, and the audio never restarts.</p>
+  </div>
+
+  <div class="panel">
+    <canvas id="scope" width="1360" height="192"></canvas>
+  </div>
+
+  <div class="panel">
+    <dl id="info"><dt>Piece</dt><dd>nothing playing yet</dd></dl>
+  </div>
+</main>
+
+<script>/*__BUNDLE__*/</script>
+<script>
+const { createAdaptive, renderToChannels, scaleNames } = BraveBeats;
+
+// The .wasm is baked into this file, so the page loads nothing from anywhere
+const WASM_BASE64 = '__WASM_BASE64__';
+const wasmBinary = Uint8Array.from(atob(WASM_BASE64), (c) => c.charCodeAt(0)).buffer;
+
+const $ = (id) => document.getElementById(id);
+const setStatus = (text, isError = false) => {
+  $('status').textContent = text;
+  $('status').classList.toggle('error', isError);
+};
+
+// The intensity each part waits for, matching the thresholds in the composer
+const LAYERS = [
+  ['drone', 0], ['bell', 0.10], ['kick', 0.30], ['low drum', 0.34],
+  ['shaker', 0.42], ['balafon', 0.44], ['mid drum', 0.52], ['slap', 0.60],
+  ['kalimba', 0.62], ['chant', 0.66], ['high drum', 0.68], ['clap', 0.76],
+];
+$('chips').innerHTML = LAYERS.map(([name]) => `<span class="chip">${name}</span>`).join('');
+const paintChips = (value) => {
+  document.querySelectorAll('.chip').forEach((chip, i) => {
+    chip.classList.toggle('on', value >= LAYERS[i][1]);
+  });
+};
+paintChips(1);
+
+scaleNames({ wasmBinary }).then((names) => {
+  for (const name of names) {
+    $('scale').insertAdjacentHTML('beforeend', `<option value="${name}">${name}</option>`);
+  }
+}).catch((error) => setStatus(String(error), true));
+
+let context = null;
+let track = null;
+let analyser = null;
+
+const options = () => ({
+  seed: Number($('seed').value) || 0,
+  loopBars: Number($('bars').value) || 8,
+  scale: $('scale').value || undefined,
+  meter: Number($('meter').value) || undefined,
+  intensity: Number($('intensity').value),
+  wasmBinary,
+});
+
+$('play').addEventListener('click', async () => {
+  try {
+    $('play').disabled = true;
+    setStatus('building the piece…');
+    teardown();
+
+    context ??= new AudioContext();
+    await context.resume();
+
+    track = await createAdaptive(context, {
+      ...options(),
+      // A page opened from disk cannot load a worklet, so allow the
+      // main-thread path rather than refusing to play at all
+      fallbackToScriptProcessor: true,
+    });
+    analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.75;
+    track.connect(analyser);
+    analyser.connect(context.destination);
+    // Handy for poking at the running graph from the console
+    window.__ctx = context;
+    window.__track = track;
+    window.__analyser = analyser;
+
+    const info = await track.ready;
+    $('info').innerHTML = `
+      <dt>Seed</dt><dd>${info.seed}</dd>
+      <dt>Tempo</dt><dd>${info.tempo.toFixed(1)} bpm</dd>
+      <dt>Meter</dt><dd>${info.pulsesPerBar === 12 ? '12/8 — four beats of three' : '4/4 — four beats of four'}</dd>
+      <dt>Scale</dt><dd>${info.scale} on MIDI ${info.root}</dd>
+      <dt>Loop</dt><dd>${info.totalBars} bars, ${info.loopSeconds.toFixed(2)}s</dd>
+      <dt>Notes</dt><dd>${info.noteCount} in the loop</dd>`;
+
+    $('fallback-note').hidden = !track.usingFallback;
+    if (track.usingFallback) {
+      $('fallback-note').innerHTML =
+        'Running on the main thread, because a page opened straight from disk ' +
+        'cannot load an audio worklet. It sounds identical but can stutter if the ' +
+        'browser gets busy. For the smooth path, serve this file over http — ' +
+        '<kbd>python3 -m http.server</kbd> in the folder containing it.';
+    }
+
+    setStatus('playing — drag the intensity slider');
+    $('stop').disabled = false;
+    draw();
+  } catch (error) {
+    setStatus(String(error), true);
+    $('play').disabled = false;
+  }
+});
+
+function teardown() {
+  if (track) { track.stop(); track = null; }
+  if (analyser) { analyser.disconnect(); analyser = null; }
+  $('stop').disabled = true;
+  $('play').disabled = false;
+}
+
+$('stop').addEventListener('click', () => { teardown(); setStatus('stopped'); });
+
+$('reseed').addEventListener('click', () => {
+  $('seed').value = Math.floor(Math.random() * 1e9);
+  if (track) $('play').click();
+});
+
+$('intensity').addEventListener('input', (event) => {
+  const value = Number(event.target.value);
+  $('intensity-value').textContent = value.toFixed(2);
+  paintChips(value);
+  if (track) track.intensity = value;
+});
+
+// A spectrum, so you can watch the ensemble fill in as intensity rises
+const canvas = $('scope');
+const pen = canvas.getContext('2d');
+function draw() {
+  requestAnimationFrame(draw);
+  const { width, height } = canvas;
+  pen.clearRect(0, 0, width, height);
+  if (!analyser) return;
+
+  const bins = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(bins);
+
+  // Log spacing, so the drums do not get squeezed into the first few pixels
+  const bars = 72;
+  const top = analyser.frequencyBinCount * 0.55;
+  const gap = 2;
+  const barWidth = width / bars;
+  for (let i = 0; i < bars; i += 1) {
+    const from = Math.floor(top ** (i / bars));
+    const to = Math.max(from + 1, Math.floor(top ** ((i + 1) / bars)));
+    let sum = 0;
+    for (let b = from; b < to && b < bins.length; b += 1) sum += bins[b];
+    const level = (sum / (to - from)) / 255;
+    const barHeight = Math.max(2, level * height * 0.95);
+    pen.fillStyle = `hsl(${24 - level * 10} ${55 + level * 30}% ${32 + level * 34}%)`;
+    pen.fillRect(i * barWidth, height - barHeight, barWidth - gap, barHeight);
+  }
+}
+draw();
+
+$('download').addEventListener('click', async () => {
+  const button = $('download');
+  button.disabled = true;
+  setStatus('rendering 60 seconds offline…');
+  try {
+    const { left, right, sampleRate, info } = await renderToChannels({
+      ...options(), loopBars: 0, duration: 60, sampleRate: 44100,
+    });
+    const blob = new Blob([toWav(left, right, sampleRate)], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+    const link = Object.assign(document.createElement('a'), {
+      href: url, download: `bravebeats-${info.seed}.wav`,
+    });
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    setStatus(`rendered ${info.totalBars} bars at ${info.tempo.toFixed(1)} bpm`);
+  } catch (error) {
+    setStatus(String(error), true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+function toWav(left, right, sampleRate) {
+  const frames = left.length;
+  const buffer = new ArrayBuffer(44 + frames * 4);
+  const view = new DataView(buffer);
+  const tag = (at, text) => { for (let i = 0; i < 4; i += 1) view.setUint8(at + i, text.charCodeAt(i)); };
+  tag(0, 'RIFF'); view.setUint32(4, 36 + frames * 4, true); tag(8, 'WAVE');
+  tag(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, 2, true); view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 4, true); view.setUint16(32, 4, true); view.setUint16(34, 16, true);
+  tag(36, 'data'); view.setUint32(40, frames * 4, true);
+  for (let i = 0; i < frames; i += 1) {
+    view.setInt16(44 + i * 4, Math.max(-1, Math.min(1, left[i])) * 32767, true);
+    view.setInt16(46 + i * 4, Math.max(-1, Math.min(1, right[i])) * 32767, true);
+  }
+  return buffer;
+}
+</script>
+</body>
+</html>

@@ -59,12 +59,29 @@ export async function loadWasmBytes(source: WasmSource = {}): Promise<Uint8Array
       ? source.wasmBinary
       : new Uint8Array(source.wasmBinary);
   }
-  const url = source.wasmUrl ?? new URL('./bravebeats.wasm', import.meta.url);
+  const url = source.wasmUrl ?? defaultWasmUrl();
   const response = await fetch(url instanceof URL ? url.href : url);
   if (!response.ok) {
     throw new Error(`bravebeats: could not fetch ${String(url)} (${response.status})`);
   }
   return new Uint8Array(await response.arrayBuffer());
+}
+
+/**
+ * Where `bravebeats.wasm` sits relative to this module, which is what a bundler
+ * resolves for you. A build with no module URL to work from - a plain script
+ * bundle, for one - has nowhere to look, and says so rather than fetching
+ * something surprising.
+ */
+function defaultWasmUrl(): URL {
+  const base = import.meta.url;
+  if (!base) {
+    throw new Error(
+      'bravebeats: this build cannot locate bravebeats.wasm on its own. ' +
+      'Pass wasmUrl or wasmBinary.',
+    );
+  }
+  return new URL('./bravebeats.wasm', base);
 }
 
 export async function instantiate(bytes: Uint8Array): Promise<BraveBeatsExports> {

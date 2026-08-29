@@ -182,6 +182,16 @@ export interface AdaptiveOptions extends BraveBeatsOptions, WasmSource {
   intensity?: number;
   /** Output gain applied inside the worklet. */
   gain?: number;
+  /**
+   * Fall back to a ScriptProcessorNode when an AudioWorklet cannot be loaded.
+   *
+   * A worklet module has to come from a real origin, so a page opened straight
+   * off disk with `file://` cannot use one - which also covers an Electron app
+   * loading its window from a file. The fallback renders the same audio on the
+   * main thread instead, where a long frame in your game can make it stutter.
+   * Off by default: you want to know when the good path is unavailable.
+   */
+  fallbackToScriptProcessor?: boolean;
 }
 
 /**
@@ -194,20 +204,29 @@ export interface AdaptiveOptions extends BraveBeatsOptions, WasmSource {
  * is safe to drive this from gameplay every frame.
  */
 export class AdaptiveTrack {
-  readonly node: AudioWorkletNode;
+  /** The node to connect. An AudioWorkletNode unless the fallback was used. */
+  readonly node: AudioNode;
   readonly ready: Promise<CompositionInfo>;
-  private currentIntensity: number;
+  /** True when this track is running on the main thread instead of a worklet. */
+  readonly usingFallback: boolean;
 
-  private constructor(node: AudioWorkletNode, intensity: number) {
+  private currentIntensity: number;
+  private readonly worklet?: AudioWorkletNode;
+  private readonly mainThread?: MainThreadPlayer;
+
+  private constructor(
+    node: AudioNode,
+    intensity: number,
+    ready: Promise<CompositionInfo>,
+    worklet?: AudioWorkletNode,
+    mainThread?: MainThreadPlayer,
+  ) {
     this.node = node;
     this.currentIntensity = intensity;
-    this.ready = new Promise<CompositionInfo>((resolve, reject) => {
-      node.port.onmessage = (event) => {
-        const message = event.data;
-        if (message.type === 'ready') resolve(message.info as CompositionInfo);
-        else if (message.type === 'error') reject(new Error(`bravebeats: ${message.message}`));
-      };
-    });
+    this.ready = ready;
+    this.worklet = worklet;
+    this.mainThread = mainThread;
+    this.usingFallback = mainThread !== undefined;
   }
 
   static async create(
@@ -220,8 +239,22 @@ export class AdaptiveTrack {
     const exports = await instantiate(bytes);
     const values = optionValues(options, exports);
     const intensity = options.intensity ?? 1;
+    const loopBars = options.loopBars ?? 8;
+    const gain = options.gain ?? 1;
 
-    await registerProcessorOnce(context);
+    try {
+      await registerProcessorOnce(context);
+    } catch (error) {
+      if (!options.fallbackToScriptProcessor) {
+        throw new Error(
+          `bravebeats: could not load the audio worklet (${String(error)}). ` +
+          'A worklet needs a real origin, so serve the page over http rather than ' +
+          'opening it from disk, or pass fallbackToScriptProcessor to run on the ' +
+          'main thread instead.',
+        );
+      }
+      return AdaptiveTrack.createOnMainThread(context, bytes, values, loopBars, intensity, gain);
+    }
 
     const node = new AudioWorkletNode(context, 'bravebeats', {
       numberOfInputs: 0,
@@ -229,15 +262,64 @@ export class AdaptiveTrack {
       outputChannelCount: [2],
       processorOptions: {
         ...values,
-        loopBars: options.loopBars ?? 8,
+        loopBars,
         intensity,
-        gain: options.gain ?? 1,
+        gain,
         maxBlock: MAX_BLOCK,
         // Copied so the worklet owns its own bytes
         wasmBinary: bytes.slice().buffer,
       },
     });
-    return new AdaptiveTrack(node, intensity);
+    const ready = new Promise<CompositionInfo>((resolve, reject) => {
+      node.port.onmessage = (event) => {
+        const message = event.data;
+        if (message.type === 'ready') resolve(message.info as CompositionInfo);
+        else if (message.type === 'error') reject(new Error(`bravebeats: ${message.message}`));
+      };
+    });
+    return new AdaptiveTrack(node, intensity, ready, node);
+  }
+
+  private static async createOnMainThread(
+    context: AudioContext,
+    bytes: Uint8Array,
+    values: ReturnType<typeof optionValues>,
+    loopBars: number,
+    intensity: number,
+    gain: number,
+  ): Promise<AdaptiveTrack> {
+    const exports = await instantiate(bytes.slice());
+    const bufferSize = 4096;
+    const engine = exports.bb_create(
+      values.seed, values.tempo, values.meter, values.scaleIndex, values.root,
+      context.sampleRate, loopBars, 0, bufferSize,
+    );
+    if (!engine) throw new Error('bravebeats: could not create the engine');
+    exports.bb_set_intensity(engine, intensity);
+
+    const player: MainThreadPlayer = { exports, engine, gain };
+    const node = context.createScriptProcessor(bufferSize, 0, 2);
+    node.onaudioprocess = (event) => {
+      const frames = event.outputBuffer.length;
+      player.exports.bb_render(player.engine, frames);
+      const memory = player.exports.memory.buffer;
+      const left = new Float32Array(memory, player.exports.bb_left(player.engine), frames);
+      const right = new Float32Array(memory, player.exports.bb_right(player.engine), frames);
+      const outLeft = event.outputBuffer.getChannelData(0);
+      const outRight = event.outputBuffer.getChannelData(1);
+      outLeft.set(left);
+      outRight.set(right);
+      if (player.gain !== 1) {
+        for (let i = 0; i < frames; i += 1) {
+          outLeft[i] *= player.gain;
+          outRight[i] *= player.gain;
+        }
+      }
+    };
+    player.node = node;
+
+    const info = readInfo(exports, engine, values.seed);
+    return new AdaptiveTrack(node, intensity, Promise.resolve(info), undefined, player);
   }
 
   /** How much of the ensemble is playing, 0 to 1. */
@@ -248,23 +330,38 @@ export class AdaptiveTrack {
   set intensity(value: number) {
     const clamped = Math.min(1, Math.max(0, value));
     this.currentIntensity = clamped;
-    this.node.port.postMessage({ type: 'intensity', value: clamped });
+    if (this.mainThread) this.mainThread.exports.bb_set_intensity(this.mainThread.engine, clamped);
+    else this.worklet?.port.postMessage({ type: 'intensity', value: clamped });
   }
 
-  /** Output gain, applied inside the worklet. */
+  /** Output gain, applied where the audio is generated. */
   setGain(value: number): void {
-    this.node.port.postMessage({ type: 'gain', value });
+    if (this.mainThread) this.mainThread.gain = value;
+    else this.worklet?.port.postMessage({ type: 'gain', value });
   }
 
   connect(destination: AudioNode): AudioNode {
     return this.node.connect(destination);
   }
 
-  /** Silences the node and lets it be collected. */
+  /** Silences the track and lets it be collected. */
   stop(): void {
-    this.node.port.postMessage({ type: 'stop' });
+    if (this.mainThread) {
+      if (this.mainThread.node) this.mainThread.node.onaudioprocess = null;
+      this.mainThread.exports.bb_destroy(this.mainThread.engine);
+      this.mainThread.engine = 0;
+    } else {
+      this.worklet?.port.postMessage({ type: 'stop' });
+    }
     this.node.disconnect();
   }
+}
+
+interface MainThreadPlayer {
+  exports: BraveBeatsExports;
+  engine: number;
+  gain: number;
+  node?: ScriptProcessorNode;
 }
 
 /** Shorthand for {@link AdaptiveTrack.create}. */
